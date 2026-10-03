@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name       				OCS 网课助手 - 全域名通用版（小猫定时进度）
-// @version    				4.15.3-cat.4
+// @version    				4.15.3-cat.5
 // @description				OCS(online-course-script) 网课助手，官网 https://docs.ocsjs.com ，专注于帮助大学生从网课中释放出来 让自己的时间把握在自己的手中，拥有人性化的操作页面，流畅的步骤提示，支持  【超星学习通】 【知到智慧树】 【职教云】 【智慧职教】 【中国大学MOOC】 【雨课堂】 等网课的学习，作业。具体的功能请查看脚本悬浮窗中的教程页面。
 // @author     				enncy
 // @license    				MIT
@@ -546,6 +546,61 @@ var __publicField = (obj, key, value) => {
   }
   function removeRedundant(str) {
     return (str == null ? void 0 : str.trim().replace(/^[A-Z]{1}[^A-Za-z0-9⺀-鿿]+([A-Za-z0-9⺀-鿿]+)/, "$1").replace(/^[A-Z]{1}([⺀-鿿][A-Za-z0-9⺀-鿿]*)/, "$1")) || "";
+  }
+  // API health checks must distinguish authentication, HTTP errors and real timeouts.
+  async function probeAnswererStatus(item, timeoutMs = 10000) {
+    const started = Date.now();
+    let timer, controller, gmHandle, settled = false;
+    const result = await new Promise((resolve) => {
+      const finish = (state, detail, status) => {
+        if (settled) return;
+        settled = true;
+        resolve({ state, detail, status, latency: Date.now() - started });
+      };
+      timer = setTimeout(() => {
+        finish("timeout", "检测超过 " + timeoutMs / 1000 + " 秒");
+        controller?.abort();
+        gmHandle?.abort?.();
+      }, timeoutMs);
+      try {
+        const configured = new URL(item.url);
+        const isDeepSeek = configured.origin === "https://api.deepseek.com";
+        const url = isDeepSeek ? configured.origin + "/models" : configured.origin + "/?t=" + started;
+        const method = isDeepSeek ? "GET" : "HEAD";
+        // Only send existing credentials to the official endpoint; never to the homepage probe.
+        const headers = isDeepSeek ? { Authorization: item.headers?.Authorization || item.headers?.authorization || "" } : {};
+        const accept = (status, body) => {
+          if (isDeepSeek) {
+            if (status === 200) {
+              try {
+                const data = JSON.parse(body);
+                if (!Array.isArray(data.data)) return finish("error", "模型列表格式异常", status);
+                return finish("ok", "官方 API 认证成功；聊天能力须另行验证", status);
+              } catch (_) { return finish("error", "模型列表不是有效 JSON", status); }
+            }
+            return finish("error", status === 401 ? "API Key 认证失败（HTTP 401）" : status === 402 ? "账户余额不足（HTTP 402）" : "官方 API 返回 HTTP " + status, status);
+          }
+          // A homepage 401/403/404/405 proves reachability, not question-bank validity.
+          if (status >= 200 && status < 600) finish("reachable", "域名可达（HTTP " + status + "）；未验证题库查询", status);
+          else finish("error", "未收到有效 HTTP 响应", status);
+        };
+        if (isDeepSeek || item.type === "fetch") {
+          controller = new AbortController();
+          fetch(url, { method, headers, signal: controller.signal, redirect: "error", credentials: "omit" })
+            .then(async (r) => accept(r.status, isDeepSeek ? await r.text() : ""))
+            .catch(() => finish("error", "网络请求失败：检查网络、跨域或浏览器权限"));
+        } else if (typeof GM_xmlhttpRequest === "function") {
+          gmHandle = GM_xmlhttpRequest({ url, method, timeout: timeoutMs,
+            onload: (r) => accept(r.status, r.responseText || ""),
+            onerror: () => finish("error", "脚本跨域请求失败"),
+            ontimeout: () => finish("timeout", "脚本跨域请求超时"),
+            onabort: () => finish("error", "检测请求已取消")
+          });
+        } else finish("error", "GM_xmlhttpRequest 不可用");
+      } catch (_) { finish("error", "检测地址或请求参数无效"); }
+    });
+    clearTimeout(timer);
+    return result;
   }
   function request(url, opts) {
     return new Promise((resolve, reject) => {
@@ -9001,35 +9056,10 @@ ${content}</tr>
                 table.style.width = "100%";
                 this.cfg.answererWrappers.forEach(async (item) => {
                   const t2 = Date.now();
-                  let success = false;
-                  let error;
                   const isDisabled = this.cfg.disabledAnswererWrapperNames.find((name) => name === item.name);
-                  const res = isDisabled ? false : await Promise.race([
-                    (async () => {
-                      try {
-                        return await request(new URL(item.url).origin + "/?t=" + t2, {
-                          type: "GM_xmlhttpRequest",
-                          method: "head",
-                          responseType: "text"
-                        });
-                      } catch (err) {
-                        error = err;
-                        return false;
-                      }
-                    })(),
-                    (async () => {
-                      await $.sleep(10 * 1e3);
-                      return false;
-                    })()
-                  ]);
-                  if (typeof res === "string") {
-                    success = true;
-                  } else {
-                    success = false;
-                  }
-                  if (error) {
-                    errorSolveGuide.style.display = "block";
-                  }
+                  const probe = isDisabled ? { state: "disabled", detail: "题库已停用" } : await probeAnswererStatus(item);
+                  const labels = { ok: "API认证成功🟢", reachable: "域名可达🔵", disabled: "已停用⚪", error: "连接失败🔴", timeout: "连接超时🟡" };
+                  if (probe.state === "error") errorSolveGuide.style.display = "block";
                   const body = lib.h("tbody");
                   body.append(lib.h("td", item.name));
                   body.append(
@@ -9037,13 +9067,13 @@ ${content}</tr>
                       lib.$ui.tooltip(
                         lib.h(
                           "span",
-                          { title: isDisabled ? "题目已经被停用，请在上方题库配置中点击开启。" : "" },
-                          success ? "连接成功🟢" : isDisabled ? "已停用⚪" : error ? "连接失败🔴" : "连接超时🟡"
+                          { title: probe.detail },
+                          labels[probe.state]
                         )
                       )
                     ])
                   );
-                  body.append(lib.h("td", `延迟 : ${success ? Date.now() - t2 : "---"}/ms`));
+                  body.append(lib.h("td", `延迟 : ${probe.state === "ok" || probe.state === "reachable" ? probe.latency : "---"}/ms`));
                   table.append(body);
                   loadedCount++;
                   if (loadedCount === this.cfg.answererWrappers.length) {
