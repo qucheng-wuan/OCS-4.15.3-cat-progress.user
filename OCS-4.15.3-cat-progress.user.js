@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name       				OCS 网课助手 - 全域名通用版（小猫定时进度）
-// @version    				4.15.3-cat.5
+// @version    				4.15.3-cat.6
 // @description				OCS(online-course-script) 网课助手，官网 https://docs.ocsjs.com ，专注于帮助大学生从网课中释放出来 让自己的时间把握在自己的手中，拥有人性化的操作页面，流畅的步骤提示，支持  【超星学习通】 【知到智慧树】 【职教云】 【智慧职教】 【中国大学MOOC】 【雨课堂】 等网课的学习，作业。具体的功能请查看脚本悬浮窗中的教程页面。
 // @author     				enncy
 // @license    				MIT
@@ -548,6 +548,29 @@ var __publicField = (obj, key, value) => {
     return (str == null ? void 0 : str.trim().replace(/^[A-Z]{1}[^A-Za-z0-9⺀-鿿]+([A-Za-z0-9⺀-鿿]+)/, "$1").replace(/^[A-Z]{1}([⺀-鿿][A-Za-z0-9⺀-鿿]*)/, "$1")) || "";
   }
   // API health checks must distinguish authentication, HTTP errors and real timeouts.
+  async function closeStudyExerciseDialog(dialog, remotePage, delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms))) {
+    const visible = (el) => !!el && el.isConnected && el.getClientRects().length > 0 && getComputedStyle(el).visibility !== "hidden";
+    const selectors = ".header-icon, .el-dialog__headerbtn, [aria-label='Close'], [aria-label='关闭']";
+    for (let attempt = 0; attempt < 3 && visible(dialog); attempt++) {
+      const close = Array.from(dialog.querySelectorAll(selectors)).find(visible);
+      if (!close) return false;
+      // The site's own close handler works even when the desktop bridge returns HTTP 405.
+      try { close.click(); } catch (_) {}
+      await delay(400);
+      if (!visible(dialog)) return true;
+      if (remotePage && attempt === 0) {
+        let timeout;
+        try {
+          await Promise.race([
+            Promise.resolve().then(() => remotePage.click(close)),
+            new Promise((_, reject) => { timeout = setTimeout(() => reject(new Error("close timeout")), 2000); })
+          ]);
+        } catch (_) {} finally { clearTimeout(timeout); }
+        await delay(400);
+      }
+    }
+    return !visible(dialog);
+  }
   async function probeAnswererStatus(item, timeoutMs = 10000) {
     const started = Date.now();
     let timer, controller, gmHandle, settled = false;
@@ -10372,46 +10395,52 @@ ${content}</tr>
       });
     }
     async handleTestDialog(remotePage) {
-      const question_box = lib.$el(".ai-class-exercise-dialog");
-      if (question_box) {
-        const options = lib.$$el(".ques-list .item .option");
-        lib.$message.info("正在关闭弹窗测验...");
-        if (options.length !== 0) {
-          await waitForCaptcha();
-          CommonProject.scripts.render.methods.minimize();
-          CommonProject.scripts.render.methods.setPosition(100, 200);
-          const random = Math.floor(Math.random() * options.length);
-          await lib.$.sleep(1e3);
-          if (remotePage) {
-            await remotePage.click(options[random]);
-          } else {
-            options[random].click();
+      if (this._exerciseDialogLoopRunning) return;
+      this._exerciseDialogLoopRunning = true;
+      const visible = (el) => !!el && el.isConnected && el.getClientRects().length > 0 && getComputedStyle(el).visibility !== "hidden";
+      try {
+        while (true) {
+          try {
+            const question_box = lib.$$el(".ai-class-exercise-dialog").find(visible);
+            if (question_box) {
+              // A submitted exercise must never be answered or submitted again.
+              const submit_btn = question_box.querySelector(".el-dialog__footer .el-button.btn");
+              const submitted = submit_btn && (submit_btn.classList.contains("is-finish") || /已提交/.test(submit_btn.textContent || ""));
+              if (!submitted) {
+                const options = Array.from(question_box.querySelectorAll(".ques-list .item .option")).filter(visible);
+                if (options.length) {
+                  await waitForCaptcha();
+                  CommonProject.scripts.render.methods.minimize();
+                  CommonProject.scripts.render.methods.setPosition(100, 200);
+                  await lib.$.sleep(1000);
+                  if (visible(question_box)) options[Math.floor(Math.random() * options.length)].click();
+                  await lib.$.sleep(1000);
+                }
+                const submit = question_box.querySelector(".el-dialog__footer .el-button.btn");
+                if (visible(submit) && !submit.disabled && !submit.classList.contains("is-finish") && !/已提交/.test(submit.textContent || "")) {
+                  submit.click();
+                  await lib.$.sleep(1000);
+                }
+              }
+              if (visible(question_box)) {
+                const closed = await closeStudyExerciseDialog(question_box, remotePage || this.remotePage);
+                if (closed) {
+                  this._exerciseDialogWarningAt = 0;
+                  lib.$message.info("弹窗测验已关闭");
+                } else if (!this._exerciseDialogWarningAt || Date.now() - this._exerciseDialogWarningAt > 30000) {
+                  this._exerciseDialogWarningAt = Date.now();
+                  lib.$message.warn("测验弹窗未能关闭，请点击弹窗右上角 ×；脚本稍后重试。");
+                }
+              }
+            }
+          } catch (_) {
+            // A transient desktop bridge error must not terminate the monitoring loop.
           }
-          await lib.$.sleep(1e3);
+          await lib.$.sleep(3000);
         }
-        await lib.$.sleep(1e3);
-        const submit_btn = lib.$el(".ai-class-exercise-dialog .el-dialog__footer .el-button.btn");
-        if (submit_btn) {
-          if (remotePage) {
-            await remotePage.hover(".ai-class-exercise-dialog .el-dialog__footer .el-button.btn");
-            await remotePage.click(".ai-class-exercise-dialog .el-dialog__footer .el-button.btn");
-          } else {
-            submit_btn.click();
-          }
-        }
-        const close_btn = lib.$el(".ai-class-exercise-dialog .header-icon");
-        if (close_btn) {
-          if (remotePage) {
-            await remotePage.hover(".ai-class-exercise-dialog .header-icon");
-            await remotePage.click(".ai-class-exercise-dialog .header-icon");
-          } else {
-            close_btn.click();
-          }
-        }
-        lib.$message.info("弹窗测验已关闭");
+      } finally {
+        this._exerciseDialogLoopRunning = false;
       }
-      await lib.$.sleep(3e3);
-      await this.handleTestDialog(remotePage);
     }
   }
   class Hike extends StudyVideoH5 {
@@ -11394,6 +11423,8 @@ ${content}</tr>
           }
           CommonProject.scripts.render.methods.pin(this);
           const processor = new WishdomH5();
+          // Closing a dialog must not wait for the desktop bridge to initialize.
+          processor.handleTestDialog().catch(() => {});
           const shared = ZHSProject.scripts["gxk-study"];
           const synchronizeStop = (value) => {
             if (shared.cfg.stopTime !== value) shared.cfg.stopTime = value;
